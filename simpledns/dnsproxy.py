@@ -131,7 +131,7 @@ class DispatchResolver(client.Resolver):
                     continue
                 self.addressMap[_path] = _addr
 
-    def pickServer(self, queries=None):
+    def pickServer(self, queries=None, order=0):
         """
         Pick upstream server according to querying address and 'Server' rules
         if no rule is matched, return the default upstream server
@@ -155,27 +155,39 @@ class DispatchResolver(client.Resolver):
         else:
             if self.verbose > 0:
                 log.msg('Dispatch server mismatch for ' + name)
-            address = self.servers[0]
+            address = self.servers[order]
         return address
 
     def queryUDP(self, queries, timeout=None):
         if timeout is None:
             timeout = self.timeout
 
-        upstream_address = self.pickServer(queries)
+        order = [0]
+        upstream_address = self.pickServer(queries, order[0])
         d = self._query(upstream_address, queries, timeout[0])
-        d.addErrback(self._reissue, upstream_address, queries, timeout)
+        d.addCallback(self._process_a_answers, order)
+        d.addErrback(self._reissue, upstream_address, queries, timeout, order)
         return d
 
-    def _reissue(self, reason, address, query, timeout):
+    def _process_a_answers(self, message, order):
+        # if dns response with wrong answer, try backup one
+        if not message.answers:
+            order[0] += 1
+            if order[0] < len(self.servers):
+                raise dns.DNSQueryTimeoutError(0)
+        return message
+
+    def _reissue(self, reason, address, query, timeout, order):
         reason.trap(dns.DNSQueryTimeoutError)
 
         timeout = timeout[1:]
         if not timeout:
             return failure.Failure(defer.TimeoutError(query))
 
-        d = self._query(address, query, timeout[0], reason.value.id)
-        d.addErrback(self._reissue, address, query, timeout)
+        upstream_address = self.pickServer(query, order[0])
+        d = self._query(upstream_address, query, timeout[0], reason.value.id)
+        d.addCallback(self._process_a_answers, order)
+        d.addErrback(self._reissue, address, query, timeout, order)
         return d
 
     def queryTCP(self, queries, timeout=10):
@@ -358,12 +370,9 @@ def main():
                         help="local port to listen",
                         default=53,
                         )
-    parser.add_argument('--upstream-ip', type=str,
-                        help="upstream DNS server ip address",
-                        default='208.67.222.222')
-    parser.add_argument('--upstream-port', type=int,
-                        help="upstream DNS server port",
-                        default=53)
+    parser.add_argument('--upstream', nargs='+', type=str,
+                        help="upstream DNS servers 208.67.222.222:53 114.114.114.114:53",
+                        default='208.67.222.222:53')
     parser.add_argument('--query-timeout', type=int,
                         help="time before close port used for querying",
                         default=1)
@@ -406,8 +415,7 @@ def main():
     addr = args.bind_addr
     port = args.bind_port
     log.msg("Listening on " + addr + ':' + str(port))
-    log.msg("Using " + args.upstream_ip + ':' +
-            str(args.upstream_port) + ' as upstream server')
+    log.msg("Using " + str(args.upstream) + ':' + ' as upstream server')
 
     hosts_file = None
     if not args.hosts_file:
@@ -422,7 +430,7 @@ def main():
             verbose=args.verbosity, cacheSize=args.cache_size, minTTL=args.min_ttl, maxTTL=args.max_ttl)],
         clients=[
             hosts.Resolver(hosts_file),
-            DispatchResolver(args.dispatch_conf, servers=[(args.upstream_ip, args.upstream_port)], minTTL=args.min_ttl, query_timeout=args.query_timeout, verbose=args.verbosity
+            DispatchResolver(args.dispatch_conf, servers=[(arg.split(':')[0], int(arg.split(':')[1])) if len(arg.split(':')) == 2 else (arg, 53) for arg in args.upstream], minTTL=args.min_ttl, query_timeout=args.query_timeout, verbose=args.verbosity
                              )],
         verbose=args.verbosity
     )
